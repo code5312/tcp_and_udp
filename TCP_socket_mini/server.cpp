@@ -4,8 +4,10 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <cstring>
 #include <csignal>
+#include <cerrno>
 #include <vector>
 #include <deque>
 #include <map>
@@ -15,19 +17,28 @@
 #define PORT 8080
 #define BACKLOG 5
 #define BUFFER_SIZE 1024
+#define MAX_OUTBOX_SIZE (64 * 1024) // 상대가 계속 안 읽어가면 outbox가 무한정 쌓이므로 상한을 둠
+#define MAX_LINE_SIZE (64 * 1024)   // 개행 없이 한없이 긴 메시지가 들어오는 것도 상한을 둠
 
 using namespace std;
 
-// 클라이언트에게 안내 메시지를 보낼 때 쓰는 헬퍼 (실패해도 로그만 남기고 계속 진행)
-void sendMsg(int fd, const string& msg) {
-    if (write(fd, msg.c_str(), msg.size()) < 0) {
-        perror("write failed");
+// fd를 non-blocking 모드로 전환 (실패해도 치명적이진 않아서 bool만 반환)
+bool setNonBlocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        perror("fcntl(F_GETFL) failed");
+        return false;
     }
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        perror("fcntl(F_SETFL) failed");
+        return false;
+    }
+    return true;
 }
 
 int main(){
     // 이미 끊긴 소켓에 write()하면 SIGPIPE가 발생해 기본 동작으로 프로세스 전체가 죽을 수 있음.
-    // 무시해두면 write()가 그냥 -1(EPIPE)을 반환하고, 우리는 그걸 이미 perror로 처리하고 있음.
+    // 무시해두면 write()가 그냥 -1(EPIPE)을 반환하고, 우리는 그걸 이미 처리하고 있음.
     signal(SIGPIPE, SIG_IGN);
 
     int listen_fd, client_fd; // 리스닝, 클라이언트 통신 소켓
@@ -65,21 +76,82 @@ int main(){
         return 1;
     }
 
+    if (!setNonBlocking(listen_fd)) {
+        return 1; // non-blocking 설계 전체가 이 전제에 의존하므로 실패 시 그냥 종료
+    }
+
     cout << "서버가 포트 " << PORT << "에서 연결을 대기 중입니다...\n";
 
     // 5. select()로 listen_fd + 모든 client_fd를 동시에 감시
     // listen_fd가 읽기 가능 -> 새 연결 도착, client_fd가 읽기 가능 -> 데이터 도착(혹은 종료)
     vector<int> clients;
-    fd_set read_fds;
+    fd_set read_fds, write_fds;
     char buffer[BUFFER_SIZE];
 
     deque<int> waiting_queue; // 매칭 대기열 (변수 하나로 관리하면, 매칭된 쌍이 있는 도중
                               // 새 대기자가 생겼다가 기존 쌍이 깨질 때 그 대기자가
                               // 덮어써져 사라지는 문제가 있어서 큐로 관리함)
     map<int, int> partner;    // fd -> 매칭된 상대방 fd (매칭된 클라이언트만 존재)
+    map<int, string> outbox;  // fd별로 커널 송신 버퍼가 꽉 차서 아직 못 보낸 데이터
+    map<int, string> inbox;   // fd별로 아직 개행('\n')으로 끝나지 않은 수신 조각 (메시지 프레이밍용)
+    vector<int> to_disconnect; // 이번 루프에서 끊기로 판단된 fd (즉시 close하지 않고 모아둠)
+
+    // fd가 이번 배치에서 이미 끊기기로 결정되어 있는지 확인 (재매칭 가드에서 사용)
+    auto isLeaving = [&](int fd) {
+        return find(to_disconnect.begin(), to_disconnect.end(), fd) != to_disconnect.end();
+    };
+
+    // fd의 outbox를 non-blocking write로 최대한 비움.
+    // 다 비웠거나 커널 송신 버퍼가 꽉 차서 잠시 못 보내는 상태(EAGAIN)면 true,
+    // 그 외 에러(상대가 확실히 죽었다고 판단)면 false.
+    auto flushOutbox = [&](int fd) -> bool {
+        auto it = outbox.find(fd);
+        if (it == outbox.end() || it->second.empty()) return true;
+        string& buf = it->second;
+        while (!buf.empty()) {
+            ssize_t n = write(fd, buf.data(), buf.size());
+            if (n > 0) {
+                buf.erase(0, n);
+                continue;
+            }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return true; // 커널 송신 버퍼가 꽉 참 -> 다음 write-ready(select의 write_fds)를 기다림
+            }
+            perror("write failed");
+            return false;
+        }
+        outbox.erase(it);
+        return true;
+    };
+
+    // 클라이언트에게 안내/relay 메시지를 보낼 때 쓰는 헬퍼.
+    // 즉시 write()하는 대신 outbox에 쌓고 바로 flush를 시도한다 -> 당장 다 못 보내도
+    // select의 write_fds가 다음 루프에서 다시 감시해주므로 여기서 블로킹되지 않는다.
+    auto sendMsg = [&](int fd, const string& msg) {
+        outbox[fd] += msg;
+        if (!flushOutbox(fd)) {
+            to_disconnect.push_back(fd);
+            return;
+        }
+        auto it = outbox.find(fd);
+        if (it != outbox.end() && it->second.size() > MAX_OUTBOX_SIZE) {
+            // 상대가 한참 안 읽어가서(느리거나 멈춘 클라이언트) 보낼 데이터가 계속 쌓이기만 함
+            // -> 무한정 버티지 않고 그냥 끊는다 (backpressure를 안 걸면 서버 메모리가 계속 늘어남)
+            cerr << "fd=" << fd << " outbox가 " << MAX_OUTBOX_SIZE << "바이트를 넘어 연결을 종료합니다.\n";
+            to_disconnect.push_back(fd);
+        }
+    };
 
     // 대기열에 2명 이상 쌓이면 앞에서부터 순서대로 짝지어줌
     auto tryMatch = [&]() {
+        // 대기열에 남아있지만 이번 배치에서 이미 끊기기로 정해진 fd는 매칭 후보에서 제외.
+        // 그냥 두면 곧 사라질 fd가 멀쩡한 제3자와 짝지어졌다가 그 fd의 disconnect() 처리
+        // 순서가 왔을 때 곧바로 풀려버리는 유령 매칭이 생김(함정 2/3과 같은 클래스의 문제인데,
+        // 그 가드들은 partner였던 상대만 확인했지 대기열 자체는 확인하지 않아서 놓쳤던 경로).
+        waiting_queue.erase(
+            remove_if(waiting_queue.begin(), waiting_queue.end(), isLeaving),
+            waiting_queue.end());
+
         while (waiting_queue.size() >= 2) {
             int a = waiting_queue.front(); waiting_queue.pop_front();
             int b = waiting_queue.front(); waiting_queue.pop_front();
@@ -91,20 +163,81 @@ int main(){
         }
     };
 
+    // 연결 종료 시 대기열/매칭 상태 정리. 실제 close()는 여기서 하되,
+    // clients 벡터에서의 제거는 인덱스를 들고 있는 호출부에서 처리한다.
+    auto disconnect = [&](int fd) {
+        auto qit = find(waiting_queue.begin(), waiting_queue.end(), fd);
+        if (qit != waiting_queue.end()) {
+            // 대기 중이던 클라이언트가 그냥 나간 경우
+            waiting_queue.erase(qit);
+        } else {
+            auto it = partner.find(fd);
+            if (it != partner.end()) {
+                int other_fd = it->second;
+                partner.erase(fd);
+                partner.erase(other_fd);
+                // 상대방도 같은 배치에서 같이 끊어질 예정이면(둘이 거의 동시에 연결을 끊은 경우),
+                // 곧 사라질 상대를 대기열에 되돌렸다가 엉뚱한 제3자와 순간적으로 재매칭시키고
+                // 곧바로 다시 풀어버리는 유령 매칭이 생기므로 이 경우엔 재매칭을 건너뜀.
+                // sendMsg() 안의 flushOutbox()가 실패해서 "알림을 보내다가" 상대가 새로
+                // to_disconnect에 추가될 수도 있으므로, 보내기 전/후 두 번 다 확인해야 함.
+                bool alreadyLeaving = isLeaving(other_fd);
+
+                // 개행 없이 끝난(=아직 relay되지 못한) 마지막 메시지가 inbox에 남아있을 수
+                // 있음 - 연결 종료 자체를 그 메시지의 끝으로 취급해서 사라지기 전에 상대에게
+                // 마저 전달한다. (MAX_LINE_SIZE 초과로 거부된 경우는 그 자리에서 이미
+                // inbox를 비워뒀으므로 여기서 다시 전달되지 않음.)
+                if (!alreadyLeaving) {
+                    auto inboxIt = inbox.find(fd);
+                    if (inboxIt != inbox.end() && !inboxIt->second.empty()) {
+                        // 원래 개행이 없어서 여기 남아있던 것이므로, 그대로 보내면 바로 뒤에
+                        // 이어붙는 "상대방이 나갔습니다" 메시지와 한 줄로 붙어버림 -> 개행을
+                        // 붙여서 별도의 한 줄로 도착하게 함.
+                        sendMsg(other_fd, inboxIt->second + "\n");
+                        alreadyLeaving = isLeaving(other_fd);
+                    }
+                }
+                if (!alreadyLeaving) {
+                    sendMsg(other_fd, "상대방이 나갔습니다. 다시 매칭 대기 중입니다...\n");
+                    alreadyLeaving = isLeaving(other_fd);
+                }
+                if (!alreadyLeaving) {
+                    // 상대방을 다시 대기열로 돌려보내고, 이미 기다리던 다른 사람이 있으면 즉시 재매칭
+                    waiting_queue.push_back(other_fd);
+                    tryMatch();
+                }
+            }
+        }
+        // 아직 outbox에 못 보낸 데이터가 남아있을 수 있음(예: 상대에게 relay한 메시지가
+        // 커널 송신 버퍼가 꽉 차서 EAGAIN으로 대기 중이던 상황에, 이 fd의 읽기 쪽에서
+        // 독립적으로 EOF/에러가 발생해 disconnect가 호출된 경우) -> 그냥 버리기 전에
+        // 마지막으로 한 번 더 flush를 시도해본다(성공/실패 여부와 무관하게 결과는 무시하고
+        // 어차피 이제 정리하고 close할 것이므로).
+        flushOutbox(fd);
+        outbox.erase(fd);
+        inbox.erase(fd);
+        close(fd);
+    };
+
     while (true) {
         // select()는 감시 후 fd_set을 "준비된 fd만 남기고" 덮어써버리므로
         // 매 루프마다 다시 채워야 함
         FD_ZERO(&read_fds);
+        FD_ZERO(&write_fds);
         FD_SET(listen_fd, &read_fds);
         int max_fd = listen_fd;
 
         for (int fd : clients) {
             FD_SET(fd, &read_fds);
+            auto it = outbox.find(fd);
+            if (it != outbox.end() && !it->second.empty()) {
+                FD_SET(fd, &write_fds); // 밀린 데이터가 있는 fd만 쓰기 가능 여부도 같이 감시
+            }
             if (fd > max_fd) max_fd = fd;
         }
 
         // timeout=NULL -> 아무 fd도 준비 안 되면 무한 대기
-        int ready = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+        int ready = select(max_fd + 1, &read_fds, &write_fds, NULL, NULL);
         if (ready < 0) {
             perror("select failed");
             break;
@@ -114,7 +247,11 @@ int main(){
         if (FD_ISSET(listen_fd, &read_fds)) {
             client_fd = accept(listen_fd, NULL, NULL);
             if (client_fd < 0) {
-                perror("accept failed");
+                if (errno != EAGAIN && errno != EWOULDBLOCK) perror("accept failed");
+            } else if (!setNonBlocking(client_fd)) {
+                // non-blocking 전환에 실패한 fd는 blocking 상태로 섞여 들어가면
+                // write() 한 번이 이벤트 루프 전체를 멈출 수 있어 아예 받지 않음
+                close(client_fd);
             } else {
                 clients.push_back(client_fd);
                 cout << "클라이언트가 연결되었습니다! (fd=" << client_fd
@@ -129,56 +266,75 @@ int main(){
             }
         }
 
-        // 기존 클라이언트들 처리 (연결 종료 시 벡터에서 제거해야 하므로 인덱스 수동 관리)
-        for (size_t i = 0; i < clients.size(); ) {
+        // 기존 클라이언트들 처리
+        for (size_t i = 0; i < clients.size(); ++i) {
             int fd = clients[i];
-            if (!FD_ISSET(fd, &read_fds)) {
-                ++i;
-                continue;
+
+            // 밀린 데이터부터 흘려보냄 (읽기보다 먼저 처리해도 순서에는 영향 없음)
+            if (FD_ISSET(fd, &write_fds)) {
+                if (!flushOutbox(fd)) {
+                    // 곧 끊길 fd이므로 아래 읽기 처리는 건너뜀 (죽은 걸로 판단한 소켓에서
+                    // 커널에 남아있던 데이터를 마저 읽어 relay해버리는 걸 방지)
+                    to_disconnect.push_back(fd);
+                    continue;
+                }
             }
 
-            ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
-            if (n <= 0) {
-                if (n == 0) {
-                    cout << "클라이언트(fd=" << fd << ")가 연결을 종료했습니다.\n";
-                } else {
-                    perror("read failed");
-                }
+            if (!FD_ISSET(fd, &read_fds)) continue;
 
-                auto qit = find(waiting_queue.begin(), waiting_queue.end(), fd);
-                if (qit != waiting_queue.end()) {
-                    // 대기 중이던 클라이언트가 그냥 나간 경우
-                    waiting_queue.erase(qit);
-                } else {
+            // 더 이상 buffer를 C 문자열처럼 다루지 않으므로 null 종료 없이 꽉 채워 읽어도 됨
+            ssize_t n = read(fd, buffer, sizeof(buffer));
+            if (n > 0) {
+                // TCP는 스트림이라 이 한 번의 read()가 클라이언트가 보낸 "한 메시지"와
+                // 같다는 보장이 없음(여러 메시지가 붙어 오거나, 한 메시지가 잘려 올 수 있음).
+                // fd별 inbox에 누적한 뒤, 개행('\n')으로 끝나는 완전한 줄 단위로만 relay한다.
+                string& buf = inbox[fd];
+                buf.append(buffer, n);
+
+                size_t pos;
+                while ((pos = buf.find('\n')) != string::npos) {
+                    string line = buf.substr(0, pos + 1); // 개행까지 포함해서 한 메시지로 취급
+                    buf.erase(0, pos + 1);
+
+                    cout << "[fd=" << fd << "] 수신된 메시지: " << line;
+
                     auto it = partner.find(fd);
                     if (it != partner.end()) {
-                        int other_fd = it->second;
-                        partner.erase(fd);
-                        partner.erase(other_fd);
-                        // 상대방을 다시 대기열로 돌려보내고, 이미 기다리던 다른 사람이 있으면 즉시 재매칭
-                        sendMsg(other_fd, "상대방이 나갔습니다. 다시 매칭 대기 중입니다...\n");
-                        waiting_queue.push_back(other_fd);
-                        tryMatch();
+                        // 매칭된 상대방에게 그대로 전달 (relay) — 자기 자신에게는 에코하지 않음
+                        sendMsg(it->second, line);
+                    } else {
+                        sendMsg(fd, "아직 매칭 대기 중입니다. 잠시만 기다려주세요.\n");
                     }
                 }
 
-                close(fd);
-                clients.erase(clients.begin() + i); // 제거 후 같은 i가 다음 원소를 가리킴
-                continue;
+                if (buf.size() > MAX_LINE_SIZE) {
+                    // 개행 없이 한없이 긴 데이터를 보내는 클라이언트 -> 무한정 버티지 않고 끊음.
+                    // disconnect()가 나중에 "끝맺음 없는 마지막 메시지"를 상대에게 마저 전달해주는데,
+                    // 이 경우는 애초에 거부하려는 데이터이므로 미리 비워서 그 흐름을 타지 않게 함.
+                    cerr << "fd=" << fd << " 한 줄이 " << MAX_LINE_SIZE << "바이트를 넘어 연결을 종료합니다.\n";
+                    buf.clear();
+                    to_disconnect.push_back(fd);
+                }
+            } else if (n == 0) {
+                cout << "클라이언트(fd=" << fd << ")가 연결을 종료했습니다.\n";
+                to_disconnect.push_back(fd);
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                perror("read failed");
+                to_disconnect.push_back(fd);
             }
-
-            buffer[n] = '\0';
-            cout << "[fd=" << fd << "] 수신된 메시지: " << buffer;
-
-            auto it = partner.find(fd);
-            if (it != partner.end()) {
-                // 매칭된 상대방에게 그대로 전달 (relay) — 자기 자신에게는 에코하지 않음
-                sendMsg(it->second, string(buffer, n));
-            } else {
-                sendMsg(fd, "아직 매칭 대기 중입니다. 잠시만 기다려주세요.\n");
-            }
-            ++i;
         }
+
+        // 이번 루프에서 끊기로 결정된 fd들을 한 번에 정리.
+        // read/write 처리 도중 바로 close()해버리면 같은 루프에서 아직 순회하지 않은
+        // fd(특히 방금 relay 대상이 된 상대방)를 건드릴 위험이 있어 모아뒀다가 여기서 처리.
+        for (size_t k = 0; k < to_disconnect.size(); ++k) {
+            int fd = to_disconnect[k];
+            auto it = find(clients.begin(), clients.end(), fd);
+            if (it == clients.end()) continue; // 이미 처리됨 (중복 등록)
+            disconnect(fd);
+            clients.erase(it);
+        }
+        to_disconnect.clear();
     }
 
     // 6. 소켓 닫기 (close)
